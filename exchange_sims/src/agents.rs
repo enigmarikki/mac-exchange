@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashMap, hash::Hash};
 
 use crate::exchange_types::Collateral;
-
+#[derive(Clone)]
 pub struct Agent {
     id: [u8; 32],
     pnl: f64,

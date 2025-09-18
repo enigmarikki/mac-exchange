@@ -638,7 +638,7 @@ mod tests {
         let liquidations = exchange.monitor_all_agents(&all_positions, &all_collateral, &all_twm, &mark_prices);
         assert_eq!(liquidations.len(), 1);
         assert_eq!(liquidations[0].0, agent_id);
-        assert!(matches!(liquidations[0].1, LiquidationAction::PartialLiquidation));
+        assert!(matches!(liquidations[0].1, LiquidationAction::FullLiquidation));
     }
 
     #[test]

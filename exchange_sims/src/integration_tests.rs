@@ -34,8 +34,8 @@ mod integration_tests {
         agents.push(agent3);
 
         // Add agents to exchange
-        for agent in &agents {
-            exchange.add_agent(agent.clone());
+        for agent in agents.clone() {
+            exchange.add_agent(agent);
         }
 
         (exchange, agents)
