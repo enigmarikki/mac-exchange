@@ -44,8 +44,8 @@ impl Pool {
             total_units: 0.0,
             reserve_ratio: 0.2,
             units_borrowed: 0.0,
-            asset_info: asset_info,
-            ltv_max: ltv_max,
+            asset_info,
+            ltv_max,
             deposit_cap: cap
         }
     }
@@ -138,6 +138,14 @@ impl Pool {
 
     pub fn update_oracle_price(&mut self, price: f64) {
         self.asset_info.oracle_price = Some(price);
+    }
+
+    pub fn get_ltv_max(&self) -> f64 {
+        self.ltv_max
+    }
+
+    pub fn get_reserve_ratio(&self) -> f64 {
+        self.reserve_ratio
     }
 }
 

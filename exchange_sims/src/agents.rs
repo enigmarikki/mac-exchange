@@ -1,6 +1,6 @@
 use rand::{RngCore, thread_rng};
-use sha2::{Digest, Sha256};
-use std::{collections::HashMap, hash::Hash};
+use sha2::Digest;
+use std::collections::HashMap;
 
 use crate::exchange_types::Collateral;
 #[derive(Clone)]

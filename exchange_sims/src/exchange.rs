@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::agents::Agent;
-use crate::exchange_types::{AssetMetadata, Collateral, LiquidationAction, Pool};
+use crate::exchange_types::{AssetMetadata, LiquidationAction, Pool};
 
 pub const USDC_POOL: [u8; 32] = [0xAA; 32];
 
@@ -23,44 +23,48 @@ pub struct BoostExchange {
     pub liquidity_pool: HashMap<[u8; 32], Pool>,
     agents: HashMap<[u8; 32], Agent>,
     liquidation_slack: f64,
-    ltv_max: f64,
-    reserve_ratio: f64,
-    usdc_total: f64,
     active_loans: HashMap<[u8; 32], f64>,
+    master_key: [u8; 32],
 }
 
 impl BoostExchange {
-    pub fn new(ltv_max: f64, reserve_ratio: f64, usdc_total: f64) -> Self {
+    pub fn new(master_key: [u8; 32]) -> Self {
         let mut exchange = BoostExchange {
             liquidity_pool: HashMap::new(),
             agents: HashMap::new(),
             liquidation_slack: 0.05,
-            ltv_max,
-            reserve_ratio,
-            usdc_total,
             active_loans: HashMap::new(),
+            master_key,
         };
 
+        // Initialize USDC pool
         let usdc_metadata = AssetMetadata::new(USDC_POOL);
-        let usdc_pool = Pool::new(usdc_metadata, 1.0, 1E9);
+        let usdc_pool = Pool::new(usdc_metadata, 1.0, 10_000_000.0);
         exchange.liquidity_pool.insert(USDC_POOL, usdc_pool);
 
         exchange
     }
 
     pub fn calculate_collateral_value(&self, collateral_positions: &HashMap<[u8; 32], CollateralPosition>) -> f64 {
-        collateral_positions.iter()
-            .map(|(_, pos)| pos.units * pos.current_price)
+        collateral_positions.values().map(|pos| pos.units * pos.current_price)
             .sum()
     }
 
     pub fn calculate_available_usdc(&self) -> f64 {
         let total_loans: f64 = self.active_loans.values().sum();
-        self.usdc_total * (1.0 - self.reserve_ratio) - total_loans
+        if let Some(usdc_pool) = self.liquidity_pool.get(&USDC_POOL) {
+            usdc_pool.get_available_liquidity() - total_loans
+        } else {
+            0.0
+        }
     }
 
-    pub fn calculate_max_loan(&self, collateral_value: f64) -> f64 {
-        let collateral_limit = collateral_value * self.ltv_max;
+    pub fn calculate_max_loan(&self, collateral_value: f64, collateral_asset_id: [u8; 32]) -> f64 {
+        let collateral_limit = if let Some(collateral_pool) = self.liquidity_pool.get(&collateral_asset_id) {
+            collateral_value * collateral_pool.get_ltv_max()
+        } else {
+            0.0
+        };
         let liquidity_limit = self.calculate_available_usdc();
         collateral_limit.min(liquidity_limit)
     }
@@ -87,21 +91,59 @@ impl BoostExchange {
         position_mmr + self.liquidation_slack * loan
     }
 
-    pub fn calculate_boost_account_equity(&self, collateral_value: f64, trading_wallet_equity: f64, loan: f64) -> f64 {
-        collateral_value * self.ltv_max + trading_wallet_equity - loan
+    pub fn calculate_boost_account_equity(&self, collateral_positions: &HashMap<[u8; 32], CollateralPosition>, trading_wallet_equity: f64, loan: f64) -> f64 {
+        let weighted_collateral_value = collateral_positions.iter()
+            .map(|(asset_id, pos)| {
+                if let Some(pool) = self.liquidity_pool.get(asset_id) {
+                    pos.units * pos.current_price * pool.get_ltv_max()
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f64>();
+
+        weighted_collateral_value + trading_wallet_equity - loan
     }
 
     pub fn is_healthy(&self, boost_account_equity: f64, maintenance_margin_requirement: f64) -> bool {
         boost_account_equity > maintenance_margin_requirement
     }
 
-    pub fn should_partial_liquidate(&self, boost_account_equity: f64, maintenance_margin_requirement: f64, collateral_value: f64, trading_wallet_equity: f64, loan: f64) -> bool {
+    pub fn should_partial_liquidate(&self, boost_account_equity: f64, maintenance_margin_requirement: f64, collateral_positions: &HashMap<[u8; 32], CollateralPosition>, trading_wallet_equity: f64, loan: f64) -> bool {
+        let weighted_collateral_value = collateral_positions.iter()
+            .map(|(asset_id, pos)| {
+                if let Some(pool) = self.liquidity_pool.get(asset_id) {
+                    pos.units * pos.current_price * pool.get_ltv_max()
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f64>();
+
         boost_account_equity <= maintenance_margin_requirement &&
-        collateral_value * self.ltv_max + trading_wallet_equity > loan * (1.0 + self.liquidation_slack)
+        weighted_collateral_value + trading_wallet_equity > loan * (1.0 + self.liquidation_slack)
     }
 
-    pub fn should_full_liquidate(&self, collateral_value: f64, trading_wallet_equity: f64, loan: f64) -> bool {
-        collateral_value * self.ltv_max + trading_wallet_equity <= loan * (1.0 + self.liquidation_slack)
+    pub fn should_full_liquidate(&self, collateral_positions: &HashMap<[u8; 32], CollateralPosition>, trading_wallet_equity: f64, loan: f64) -> bool {
+        let weighted_collateral_value = collateral_positions.iter()
+            .map(|(asset_id, pos)| {
+                if let Some(pool) = self.liquidity_pool.get(asset_id) {
+                    pos.units * pos.current_price * pool.get_ltv_max()
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f64>();
+
+        weighted_collateral_value + trading_wallet_equity <= loan * (1.0 + self.liquidation_slack)
+    }
+
+    pub fn add_pool(&mut self, caller_key: [u8; 32], pool_id: [u8; 32], pool: Pool) -> Result<(), String> {
+        if caller_key != self.master_key {
+            return Err("Only master can add pools".to_string());
+        }
+        self.liquidity_pool.insert(pool_id, pool);
+        Ok(())
     }
 
     pub fn add_agent(&mut self, agent: Agent) {
@@ -113,8 +155,21 @@ impl BoostExchange {
             return Err("Insufficient liquidity in USDC pool".to_string());
         }
 
-        self.active_loans.insert(agent_id, loan_amount);
+        // Update existing loan or create new one
+        let current_loan = self.active_loans.get(&agent_id).copied().unwrap_or(0.0);
+        self.active_loans.insert(agent_id, current_loan + loan_amount);
         Ok(())
+    }
+
+    pub fn accrue_interest(&mut self, interest_rate: f64) {
+        // Apply interest to all active loans (interest_rate should be per-tick rate)
+        for loan_amount in self.active_loans.values_mut() {
+            *loan_amount *= 1.0 + interest_rate;
+        }
+    }
+
+    pub fn get_total_loans_outstanding(&self) -> f64 {
+        self.active_loans.values().sum()
     }
 
     pub fn repay_loan(&mut self, agent_id: [u8; 32], repay_amount: f64) -> Result<(), String> {
@@ -159,11 +214,11 @@ impl BoostExchange {
             let collateral_value = self.calculate_collateral_value(collateral_positions);
             let trading_wallet_equity = self.calculate_trading_wallet_equity(positions, mark_prices, trading_wallet_margin);
             let maintenance_margin_requirement = self.calculate_maintenance_margin_requirement(positions, mark_prices, loan);
-            let boost_account_equity = self.calculate_boost_account_equity(collateral_value, trading_wallet_equity, loan);
+            let boost_account_equity = self.calculate_boost_account_equity(collateral_positions, trading_wallet_equity, loan);
 
-            if self.should_full_liquidate(collateral_value, trading_wallet_equity, loan) {
+            if self.should_full_liquidate(collateral_positions, trading_wallet_equity, loan) {
                 liquidation_events.push((*agent_id, LiquidationAction::FullLiquidation));
-            } else if self.should_partial_liquidate(boost_account_equity, maintenance_margin_requirement, collateral_value, trading_wallet_equity, loan) {
+            } else if self.should_partial_liquidate(boost_account_equity, maintenance_margin_requirement, collateral_positions, trading_wallet_equity, loan) {
                 liquidation_events.push((*agent_id, LiquidationAction::PartialLiquidation));
             }
         }
@@ -178,7 +233,19 @@ mod tests {
     use crate::exchange_types::Collateral;
 
     fn create_test_exchange() -> BoostExchange {
-        BoostExchange::new(0.8, 0.2, 1_000_000.0)
+        let mut exchange = BoostExchange::new([0xAA; 32]);
+
+        // Add a test collateral pool with ltv_max 0.8
+        let test_asset = AssetMetadata::new([0x01; 32]);
+        let test_pool = Pool::new(test_asset, 0.8, 1_000_000.0);
+        exchange.add_pool([0xAA; 32], [0x01; 32], test_pool).unwrap();
+
+        // Seed USDC pool with funds
+        if let Some(usdc_pool) = exchange.liquidity_pool.get_mut(&USDC_POOL) {
+            usdc_pool.add_collateral([0xFF; 32], 1_000_000.0).unwrap();
+        }
+
+        exchange
     }
 
     fn create_test_agent() -> Agent {
@@ -192,13 +259,11 @@ mod tests {
     #[test]
     fn test_new_exchange_creation() {
         let exchange = create_test_exchange();
-        assert_eq!(exchange.ltv_max, 0.8);
-        assert_eq!(exchange.reserve_ratio, 0.2);
-        assert_eq!(exchange.usdc_total, 1_000_000.0);
         assert_eq!(exchange.liquidation_slack, 0.05);
         assert!(exchange.liquidity_pool.contains_key(&USDC_POOL));
         assert!(exchange.agents.is_empty());
         assert!(exchange.active_loans.is_empty());
+        assert_eq!(exchange.master_key, [0xAA; 32]);
     }
 
     #[test]
@@ -235,7 +300,7 @@ mod tests {
     fn test_calculate_available_usdc_no_loans() {
         let exchange = create_test_exchange();
         let available = exchange.calculate_available_usdc();
-        assert_eq!(available, 1_000_000.0 * (1.0 - 0.2));
+        // USDC pool has 1M units, 0.2 reserve ratio = 800K available
         assert_eq!(available, 800_000.0);
     }
 
@@ -254,7 +319,7 @@ mod tests {
     fn test_calculate_max_loan_collateral_limited() {
         let exchange = create_test_exchange();
         let collateral_value = 1000.0;
-        let max_loan = exchange.calculate_max_loan(collateral_value);
+        let max_loan = exchange.calculate_max_loan(collateral_value, [0x01; 32]);
         assert_eq!(max_loan, collateral_value * 0.8);
         assert_eq!(max_loan, 800.0);
     }
@@ -265,7 +330,7 @@ mod tests {
         exchange.active_loans.insert([0x01; 32], 790_000.0);
 
         let collateral_value = 1_000_000.0;
-        let max_loan = exchange.calculate_max_loan(collateral_value);
+        let max_loan = exchange.calculate_max_loan(collateral_value, [0x01; 32]);
         assert_eq!(max_loan, 10_000.0);
     }
 
@@ -354,13 +419,17 @@ mod tests {
     #[test]
     fn test_calculate_boost_account_equity() {
         let exchange = create_test_exchange();
-        let collateral_value = 10_000.0;
+        let mut collateral_positions = HashMap::new();
+        collateral_positions.insert([0x01; 32], CollateralPosition {
+            units: 100.0,
+            entry_price: 100.0,
+            current_price: 100.0,
+        });
         let trading_wallet_equity = 5_000.0;
         let loan = 8_000.0;
 
-        let equity = exchange.calculate_boost_account_equity(collateral_value, trading_wallet_equity, loan);
-        assert_eq!(equity, collateral_value * 0.8 + trading_wallet_equity - loan);
-        assert_eq!(equity, 8_000.0 + 5_000.0 - 8_000.0);
+        let equity = exchange.calculate_boost_account_equity(&collateral_positions, trading_wallet_equity, loan);
+        // 100 units * 100 price * 0.8 ltv = 8000 + 5000 - 8000 = 5000
         assert_eq!(equity, 5_000.0);
     }
 
@@ -387,14 +456,19 @@ mod tests {
         let exchange = create_test_exchange();
         let boost_account_equity = 4_000.0;
         let maintenance_margin_requirement = 5_000.0;
-        let collateral_value = 10_000.0;
+        let mut collateral_positions = HashMap::new();
+        collateral_positions.insert([0x01; 32], CollateralPosition {
+            units: 125.0,
+            entry_price: 80.0,
+            current_price: 80.0,
+        });
         let trading_wallet_equity = 3_000.0;
         let loan = 8_000.0;
 
         assert!(exchange.should_partial_liquidate(
             boost_account_equity,
             maintenance_margin_requirement,
-            collateral_value,
+            &collateral_positions,
             trading_wallet_equity,
             loan
         ));
@@ -405,14 +479,19 @@ mod tests {
         let exchange = create_test_exchange();
         let boost_account_equity = 6_000.0;
         let maintenance_margin_requirement = 5_000.0;
-        let collateral_value = 10_000.0;
+        let mut collateral_positions = HashMap::new();
+        collateral_positions.insert([0x01; 32], CollateralPosition {
+            units: 125.0,
+            entry_price: 80.0,
+            current_price: 80.0,
+        });
         let trading_wallet_equity = 3_000.0;
         let loan = 8_000.0;
 
         assert!(!exchange.should_partial_liquidate(
             boost_account_equity,
             maintenance_margin_requirement,
-            collateral_value,
+            &collateral_positions,
             trading_wallet_equity,
             loan
         ));
@@ -423,14 +502,19 @@ mod tests {
         let exchange = create_test_exchange();
         let boost_account_equity = 4_000.0;
         let maintenance_margin_requirement = 5_000.0;
-        let collateral_value = 5_000.0;
+        let mut collateral_positions = HashMap::new();
+        collateral_positions.insert([0x01; 32], CollateralPosition {
+            units: 62.5,
+            entry_price: 80.0,
+            current_price: 80.0,
+        });
         let trading_wallet_equity = 1_000.0;
         let loan = 8_000.0;
 
         assert!(!exchange.should_partial_liquidate(
             boost_account_equity,
             maintenance_margin_requirement,
-            collateral_value,
+            &collateral_positions,
             trading_wallet_equity,
             loan
         ));
@@ -439,21 +523,54 @@ mod tests {
     #[test]
     fn test_should_full_liquidate_true() {
         let exchange = create_test_exchange();
-        let collateral_value = 5_000.0;
+        let mut collateral_positions = HashMap::new();
+        collateral_positions.insert([0x01; 32], CollateralPosition {
+            units: 62.5,
+            entry_price: 80.0,
+            current_price: 80.0,
+        });
         let trading_wallet_equity = 1_000.0;
         let loan = 8_000.0;
 
-        assert!(exchange.should_full_liquidate(collateral_value, trading_wallet_equity, loan));
+        assert!(exchange.should_full_liquidate(&collateral_positions, trading_wallet_equity, loan));
     }
 
     #[test]
     fn test_should_full_liquidate_false() {
         let exchange = create_test_exchange();
-        let collateral_value = 10_000.0;
+        let mut collateral_positions = HashMap::new();
+        collateral_positions.insert([0x01; 32], CollateralPosition {
+            units: 125.0,
+            entry_price: 80.0,
+            current_price: 80.0,
+        });
         let trading_wallet_equity = 3_000.0;
         let loan = 8_000.0;
 
-        assert!(!exchange.should_full_liquidate(collateral_value, trading_wallet_equity, loan));
+        assert!(!exchange.should_full_liquidate(&collateral_positions, trading_wallet_equity, loan));
+    }
+
+    #[test]
+    fn test_add_pool_success() {
+        let mut exchange = create_test_exchange();
+        let test_asset = AssetMetadata::new([0x99; 32]);
+        let test_pool = Pool::new(test_asset, 0.75, 500_000.0);
+
+        let result = exchange.add_pool([0xAA; 32], [0x99; 32], test_pool);
+        assert!(result.is_ok());
+        assert!(exchange.liquidity_pool.contains_key(&[0x99; 32]));
+    }
+
+    #[test]
+    fn test_add_pool_unauthorized() {
+        let mut exchange = create_test_exchange();
+        let test_asset = AssetMetadata::new([0x99; 32]);
+        let test_pool = Pool::new(test_asset, 0.75, 500_000.0);
+
+        let result = exchange.add_pool([0xBB; 32], [0x99; 32], test_pool);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Only master can add pools");
+        assert!(!exchange.liquidity_pool.contains_key(&[0x99; 32]));
     }
 
     #[test]

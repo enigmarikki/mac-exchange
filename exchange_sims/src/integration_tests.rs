@@ -6,7 +6,25 @@ mod integration_tests {
     use std::collections::HashMap;
 
     fn setup_exchange_with_agents() -> (BoostExchange, Vec<Agent>) {
-        let mut exchange = BoostExchange::new(0.8, 0.2, 1_000_000.0);
+        let mut exchange = BoostExchange::new([0xAA; 32]);
+
+        // Set up test pools
+        let asset1 = crate::exchange_types::AssetMetadata::new([0x01; 32]);
+        let pool1 = crate::exchange_types::Pool::new(asset1, 0.8, 1_000_000.0);
+        exchange.add_pool([0xAA; 32], [0x01; 32], pool1).unwrap();
+
+        let asset2 = crate::exchange_types::AssetMetadata::new([0x02; 32]);
+        let pool2 = crate::exchange_types::Pool::new(asset2, 0.7, 500_000.0);
+        exchange.add_pool([0xAA; 32], [0x02; 32], pool2).unwrap();
+
+        let asset3 = crate::exchange_types::AssetMetadata::new([0x03; 32]);
+        let pool3 = crate::exchange_types::Pool::new(asset3, 0.6, 300_000.0);
+        exchange.add_pool([0xAA; 32], [0x03; 32], pool3).unwrap();
+
+        // Seed USDC pool
+        if let Some(usdc_pool) = exchange.liquidity_pool.get_mut(&USDC_POOL) {
+            usdc_pool.add_collateral([0xFF; 32], 1_000_000.0).unwrap();
+        }
 
         let mut agents = Vec::new();
 
@@ -211,7 +229,21 @@ mod integration_tests {
 
     #[test]
     fn test_collateral_and_position_calculations() {
-        let exchange = BoostExchange::new(0.75, 0.25, 2_000_000.0);
+        let mut exchange = BoostExchange::new([0xBB; 32]);
+
+        // Set up pools for the test
+        let asset1 = crate::exchange_types::AssetMetadata::new([0x01; 32]);
+        let pool1 = crate::exchange_types::Pool::new(asset1, 0.75, 1_000_000.0);
+        exchange.add_pool([0xBB; 32], [0x01; 32], pool1).unwrap();
+
+        let asset2 = crate::exchange_types::AssetMetadata::new([0x02; 32]);
+        let pool2 = crate::exchange_types::Pool::new(asset2, 0.75, 500_000.0);
+        exchange.add_pool([0xBB; 32], [0x02; 32], pool2).unwrap();
+
+        // Seed USDC pool with 2M
+        if let Some(usdc_pool) = exchange.liquidity_pool.get_mut(&USDC_POOL) {
+            usdc_pool.add_collateral([0xFF; 32], 2_000_000.0).unwrap();
+        }
 
         // Test collateral value calculation
         let mut collateral_positions = HashMap::new();
@@ -231,7 +263,7 @@ mod integration_tests {
         assert_eq!(total_collateral_value, 153_000.0);
 
         // Test max loan calculation
-        let max_loan = exchange.calculate_max_loan(total_collateral_value);
+        let max_loan = exchange.calculate_max_loan(total_collateral_value, [0x01; 32]);
         let collateral_limit = total_collateral_value * 0.75;
         let liquidity_limit = 2_000_000.0 * 0.75;
         assert_eq!(max_loan, collateral_limit.min(liquidity_limit));
@@ -275,15 +307,25 @@ mod integration_tests {
         assert_eq!(mmr, 5_625.0);
 
         // Test boost account equity
-        let boost_equity = exchange.calculate_boost_account_equity(total_collateral_value, trading_equity, loan);
-        assert_eq!(boost_equity, total_collateral_value * 0.75 + trading_equity - loan);
-        assert_eq!(boost_equity, 114_750.0 + 20_875.0 - 80_000.0);
+        let mut test_collateral_positions = HashMap::new();
+        test_collateral_positions.insert([0x01; 32], CollateralPosition {
+            units: 500.0,
+            entry_price: 250.0,
+            current_price: 250.0,
+        });
+        test_collateral_positions.insert([0x02; 32], CollateralPosition {
+            units: 200.0,
+            entry_price: 140.0,
+            current_price: 140.0,
+        });
+        let boost_equity = exchange.calculate_boost_account_equity(&test_collateral_positions, trading_equity, loan);
+        // 500 * 250 * 0.75 + 200 * 140 * 0.75 + 20875 - 80000 = 93750 + 21000 + 20875 - 80000 = 55625
         assert_eq!(boost_equity, 55_625.0);
 
         // Test health checks
         assert!(exchange.is_healthy(boost_equity, mmr));
-        assert!(!exchange.should_partial_liquidate(boost_equity, mmr, total_collateral_value, trading_equity, loan));
-        assert!(!exchange.should_full_liquidate(total_collateral_value, trading_equity, loan));
+        assert!(!exchange.should_partial_liquidate(boost_equity, mmr, &test_collateral_positions, trading_equity, loan));
+        assert!(!exchange.should_full_liquidate(&test_collateral_positions, trading_equity, loan));
     }
 
     #[test]
@@ -293,7 +335,7 @@ mod integration_tests {
 
         // Agent takes maximum leverage
         let collateral_value = 100_000.0;
-        let max_loan = exchange.calculate_max_loan(collateral_value);
+        let max_loan = exchange.calculate_max_loan(collateral_value, [0x01; 32]);
         exchange.register_loan(agent_id, max_loan).unwrap();
         agents[0].borrow(max_loan).unwrap();
 
